@@ -10,6 +10,7 @@ import os  # Used to check if CSV file exists
 import sys  # Used to exit the script
 import json
 import zipfile
+import datetime  # Import datetime for proper handling in Lambda function
 
 def parse_endpoint(endpoint):
     """
@@ -308,6 +309,10 @@ def get_user_inputs():
         else:
             print(f"File '{local_csv_path}' does not exist. Please enter a valid file path.")
 
+    # Get AWS account ID
+    sts_client = boto3.client('sts')
+    account_id = sts_client.get_caller_identity()['Account']
+
     return {
         "host": host,
         "port": port,
@@ -319,7 +324,8 @@ def get_user_inputs():
         "local_csv_path": local_csv_path,
         "region": region,
         "db_user": db_user,
-        "cluster_identifier": cluster_identifier
+        "cluster_identifier": cluster_identifier,
+        "account_id": account_id
     }
 
 def get_temporary_credentials(db_user, cluster_identifier, database, region):
@@ -447,14 +453,14 @@ def generate_lambda_code(inputs):
     """
     Generate the Lambda function code as a string.
     """
-    lambda_code = f"""
-import boto3
-import os
+    lambda_code = f'''import boto3
+import json
+import datetime
 
 def lambda_handler(event, context):
     redshift = boto3.client('redshift-data', region_name='{inputs['region']}')
 
-    sql_statement = \"""
+    sql_statement = """
         COPY {inputs['schema_name']}.{inputs['table_name']}
         FROM '{inputs['s3_path']}'
         IAM_ROLE '{inputs['iam_role']}'
@@ -469,7 +475,7 @@ def lambda_handler(event, context):
         ACCEPTINVCHARS
         COMPUPDATE OFF
         STATUPDATE OFF;
-    \"""
+    """
 
     try:
         response = redshift.execute_statement(
@@ -479,16 +485,31 @@ def lambda_handler(event, context):
             Sql=sql_statement
         )
         print("Data load initiated successfully.")
-        return response
+        # Process the response to ensure JSON serializable
+        serializable_response = make_serializable(response)
+        return serializable_response
     except Exception as e:
         print(f"Error executing COPY command: {{e}}")
         raise
-"""
+
+def make_serializable(obj):
+    """
+    Recursively convert objects to make them JSON serializable.
+    """
+    if isinstance(obj, dict):
+        return {{k: make_serializable(v) for k, v in obj.items()}}
+    elif isinstance(obj, list):
+        return [make_serializable(element) for element in obj]
+    elif isinstance(obj, (datetime.datetime, datetime.date, datetime.time)):
+        return obj.isoformat()
+    else:
+        return obj
+'''
     return lambda_code
 
-def create_lambda_iam_role(role_name):
+def create_lambda_iam_role(role_name, inputs):
     """
-    Create an IAM role for the Lambda function if it doesn't exist.
+    Create an IAM role for the Lambda function if it doesn't exist and attach necessary policies.
     """
     iam_client = boto3.client('iam')
     lambda_assume_role_policy = {
@@ -548,24 +569,53 @@ def create_lambda_iam_role(role_name):
         else:
             print(f"Assume role policy for {role_name} already allows Lambda service.")
 
-    # Attach necessary policies to the role
-    policies = [
+    # Attach necessary managed policies to the role
+    managed_policies = [
         'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole',
         'arn:aws:iam::aws:policy/AmazonRedshiftDataFullAccess',
         'arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess'
     ]
-    for policy_arn in policies:
+    for policy_arn in managed_policies:
         try:
             iam_client.attach_role_policy(
                 RoleName=role_name,
                 PolicyArn=policy_arn
             )
+            print(f"Attached policy {policy_arn} to role {role_name}.")
         except iam_client.exceptions.ClientError as e:
             if e.response['Error']['Code'] == 'EntityAlreadyExists':
                 continue
             else:
                 print(f"Error attaching policy {policy_arn}: {e}")
                 raise
+
+    # Create inline policy for redshift:GetClusterCredentials and include cluster resource
+    inline_policy = {
+        'Version': '2012-10-17',
+        'Statement': [
+            {
+                'Effect': 'Allow',
+                'Action': 'redshift:GetClusterCredentials',
+                'Resource': [
+                    f"arn:aws:redshift:{inputs['region']}:{inputs['account_id']}:cluster:{inputs['cluster_identifier']}",
+                    f"arn:aws:redshift:{inputs['region']}:{inputs['account_id']}:dbname:{inputs['cluster_identifier']}/{inputs['database']}",
+                    f"arn:aws:redshift:{inputs['region']}:{inputs['account_id']}:dbuser:{inputs['cluster_identifier']}/{inputs['db_user']}"
+                ]
+            }
+        ]
+    }
+
+    try:
+        iam_client.put_role_policy(
+            RoleName=role_name,
+            PolicyName='RedshiftGetClusterCredentialsPolicy',
+            PolicyDocument=json.dumps(inline_policy)
+        )
+        print(f"Attached inline policy 'RedshiftGetClusterCredentialsPolicy' to role {role_name}.")
+    except Exception as e:
+        print(f"Error attaching inline policy: {e}")
+        raise
+
     return iam_role_arn
 
 def create_lambda_function(inputs, lambda_filename):
@@ -578,10 +628,11 @@ def create_lambda_function(inputs, lambda_filename):
     zip_filename = 'redshift_load_lambda.zip'
     with zipfile.ZipFile(zip_filename, 'w') as z:
         z.write(lambda_filename)
+    print(f"Lambda function code zipped into {zip_filename}.")
 
     # Create IAM role for Lambda if not exists
     iam_role_name = 'RedshiftLoadLambdaRole'
-    iam_role_arn = create_lambda_iam_role(iam_role_name)
+    iam_role_arn = create_lambda_iam_role(iam_role_name, inputs)
 
     # Read the zip file contents
     with open(zip_filename, 'rb') as f:
@@ -602,12 +653,19 @@ def create_lambda_function(inputs, lambda_filename):
         print("Lambda function created successfully.")
     except lambda_client.exceptions.ResourceConflictException:
         # Function already exists, update it
-        response = lambda_client.update_function_code(
-            FunctionName='RedshiftLoadLambdaFunction',
-            ZipFile=zipped_code,
-            Publish=True
-        )
-        print("Lambda function code updated successfully.")
+        try:
+            response = lambda_client.update_function_code(
+                FunctionName='RedshiftLoadLambdaFunction',
+                ZipFile=zipped_code,
+                Publish=True
+            )
+            print("Lambda function code updated successfully.")
+        except Exception as e:
+            print(f"Error updating Lambda function code: {e}")
+            raise
+    except Exception as e:
+        print(f"Error creating/updating Lambda function: {e}")
+        raise
 
 def setup_eventbridge_rule(inputs, frequency):
     """
@@ -670,10 +728,10 @@ def setup_eventbridge_rule(inputs, frequency):
                 Principal='events.amazonaws.com',
                 SourceArn=rule_arn
             )
+            print("Permission granted to EventBridge to invoke the Lambda function.")
         except lambda_client.exceptions.ResourceConflictException:
             # Permission already exists
-            pass
-
+            print("Permission for EventBridge to invoke Lambda function already exists.")
     except Exception as e:
         print(f"Error adding target to EventBridge rule: {e}")
         raise
