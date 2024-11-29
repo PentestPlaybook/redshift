@@ -8,6 +8,8 @@ import subprocess  # Used for using 'nc' to check port connectivity
 import re  # Used for regex parsing
 import os  # Used to check if CSV file exists
 import sys  # Used to exit the script
+import json
+import zipfile
 
 def parse_endpoint(endpoint):
     """
@@ -441,6 +443,265 @@ def load_data_to_redshift(schema_name, table_name, s3_path, iam_role, region, co
         print(f"Failed to load data: {e}")
         raise
 
+def generate_lambda_code(inputs):
+    """
+    Generate the Lambda function code as a string.
+    """
+    lambda_code = f"""
+import boto3
+import os
+
+def lambda_handler(event, context):
+    redshift = boto3.client('redshift-data', region_name='{inputs['region']}')
+
+    sql_statement = \"""
+        COPY {inputs['schema_name']}.{inputs['table_name']}
+        FROM '{inputs['s3_path']}'
+        IAM_ROLE '{inputs['iam_role']}'
+        REGION '{inputs['region']}'
+        DELIMITER ','
+        IGNOREHEADER 1
+        FORMAT AS CSV
+        EMPTYASNULL
+        BLANKSASNULL
+        TIMEFORMAT 'auto'
+        TRUNCATECOLUMNS
+        ACCEPTINVCHARS
+        COMPUPDATE OFF
+        STATUPDATE OFF;
+    \"""
+
+    try:
+        response = redshift.execute_statement(
+            ClusterIdentifier='{inputs['cluster_identifier']}',
+            Database='{inputs['database']}',
+            DbUser='{inputs['db_user']}',
+            Sql=sql_statement
+        )
+        print("Data load initiated successfully.")
+        return response
+    except Exception as e:
+        print(f"Error executing COPY command: {{e}}")
+        raise
+"""
+    return lambda_code
+
+def create_lambda_iam_role(role_name):
+    """
+    Create an IAM role for the Lambda function if it doesn't exist.
+    """
+    iam_client = boto3.client('iam')
+    lambda_assume_role_policy = {
+        'Version': '2012-10-17',
+        'Statement': [
+            {
+                'Effect': 'Allow',
+                'Principal': {
+                    'Service': 'lambda.amazonaws.com'
+                },
+                'Action': 'sts:AssumeRole'
+            }
+        ]
+    }
+
+    try:
+        response = iam_client.create_role(
+            RoleName=role_name,
+            AssumeRolePolicyDocument=json.dumps(lambda_assume_role_policy),
+            Description='Role for Lambda function to load data into Redshift'
+        )
+        iam_role_arn = response['Role']['Arn']
+        print(f"IAM role {role_name} created.")
+    except iam_client.exceptions.EntityAlreadyExistsException:
+        response = iam_client.get_role(RoleName=role_name)
+        iam_role_arn = response['Role']['Arn']
+        print(f"IAM role {role_name} already exists.")
+
+        # Get the existing assume role policy document
+        assume_role_policy = response['Role']['AssumeRolePolicyDocument']
+
+        # Check if the policy already allows Lambda to assume the role
+        lambda_principal_exists = False
+        for statement in assume_role_policy.get('Statement', []):
+            principal_service = statement.get('Principal', {}).get('Service', [])
+            if isinstance(principal_service, str):
+                principal_service = [principal_service]
+            if 'lambda.amazonaws.com' in principal_service:
+                lambda_principal_exists = True
+                break
+
+        if not lambda_principal_exists:
+            # Add the necessary statement to the assume role policy
+            assume_role_policy['Statement'].append({
+                'Effect': 'Allow',
+                'Principal': {
+                    'Service': 'lambda.amazonaws.com'
+                },
+                'Action': 'sts:AssumeRole'
+            })
+            # Update the assume role policy document
+            iam_client.update_assume_role_policy(
+                RoleName=role_name,
+                PolicyDocument=json.dumps(assume_role_policy)
+            )
+            print(f"Updated assume role policy for {role_name} to allow Lambda service.")
+        else:
+            print(f"Assume role policy for {role_name} already allows Lambda service.")
+
+    # Attach necessary policies to the role
+    policies = [
+        'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole',
+        'arn:aws:iam::aws:policy/AmazonRedshiftDataFullAccess',
+        'arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess'
+    ]
+    for policy_arn in policies:
+        try:
+            iam_client.attach_role_policy(
+                RoleName=role_name,
+                PolicyArn=policy_arn
+            )
+        except iam_client.exceptions.ClientError as e:
+            if e.response['Error']['Code'] == 'EntityAlreadyExists':
+                continue
+            else:
+                print(f"Error attaching policy {policy_arn}: {e}")
+                raise
+    return iam_role_arn
+
+def create_lambda_function(inputs, lambda_filename):
+    """
+    Create the Lambda function in AWS.
+    """
+    lambda_client = boto3.client('lambda', region_name=inputs['region'])
+
+    # Zip the lambda function code
+    zip_filename = 'redshift_load_lambda.zip'
+    with zipfile.ZipFile(zip_filename, 'w') as z:
+        z.write(lambda_filename)
+
+    # Create IAM role for Lambda if not exists
+    iam_role_name = 'RedshiftLoadLambdaRole'
+    iam_role_arn = create_lambda_iam_role(iam_role_name)
+
+    # Read the zip file contents
+    with open(zip_filename, 'rb') as f:
+        zipped_code = f.read()
+
+    try:
+        response = lambda_client.create_function(
+            FunctionName='RedshiftLoadLambdaFunction',
+            Runtime='python3.8',
+            Role=iam_role_arn,
+            Handler='redshift_load_lambda.lambda_handler',
+            Code={'ZipFile': zipped_code},
+            Description='Lambda function to load data from S3 to Redshift',
+            Timeout=300,
+            MemorySize=128,
+            Publish=True
+        )
+        print("Lambda function created successfully.")
+    except lambda_client.exceptions.ResourceConflictException:
+        # Function already exists, update it
+        response = lambda_client.update_function_code(
+            FunctionName='RedshiftLoadLambdaFunction',
+            ZipFile=zipped_code,
+            Publish=True
+        )
+        print("Lambda function code updated successfully.")
+
+def setup_eventbridge_rule(inputs, frequency):
+    """
+    Set up an EventBridge rule to trigger the Lambda function at the specified frequency.
+    """
+    events_client = boto3.client('events', region_name=inputs['region'])
+    lambda_client = boto3.client('lambda', region_name=inputs['region'])
+
+    # Define the schedule expression based on the frequency
+    if frequency == 'daily':
+        schedule_expression = 'rate(1 day)'
+    elif frequency == 'weekly':
+        schedule_expression = 'rate(7 days)'
+    elif frequency == 'monthly':
+        schedule_expression = 'cron(0 0 1 * ? *)'  # At 00:00 on day-of-month 1
+    else:
+        print("Invalid frequency.")
+        return
+
+    rule_name = 'RedshiftLoadLambdaSchedule'
+
+    # Create or update the EventBridge rule
+    try:
+        response = events_client.put_rule(
+            Name=rule_name,
+            ScheduleExpression=schedule_expression,
+            State='ENABLED',
+            Description='Schedule to trigger the Lambda function to load data into Redshift'
+        )
+        rule_arn = response['RuleArn']
+        print("EventBridge rule created or updated successfully.")
+    except Exception as e:
+        print(f"Error creating EventBridge rule: {e}")
+        raise
+
+    # Add Lambda function as target
+    try:
+        # Get Lambda function ARN
+        response = lambda_client.get_function(FunctionName='RedshiftLoadLambdaFunction')
+        lambda_function_arn = response['Configuration']['FunctionArn']
+
+        # Add Lambda function as target to the EventBridge rule
+        response = events_client.put_targets(
+            Rule=rule_name,
+            Targets=[
+                {
+                    'Id': '1',
+                    'Arn': lambda_function_arn
+                }
+            ]
+        )
+        print("Lambda function added as target to EventBridge rule.")
+
+        # Give permission to EventBridge to invoke the Lambda function
+        try:
+            lambda_client.add_permission(
+                FunctionName='RedshiftLoadLambdaFunction',
+                StatementId='EventBridgeInvokeLambda',
+                Action='lambda:InvokeFunction',
+                Principal='events.amazonaws.com',
+                SourceArn=rule_arn
+            )
+        except lambda_client.exceptions.ResourceConflictException:
+            # Permission already exists
+            pass
+
+    except Exception as e:
+        print(f"Error adding target to EventBridge rule: {e}")
+        raise
+
+def schedule_automatic_load(inputs):
+    # Ask for frequency
+    frequency = input("Enter the frequency of automatic load (Daily, Weekly, Monthly): ").strip().lower()
+    # Validate frequency
+    if frequency not in ['daily', 'weekly', 'monthly']:
+        print("Invalid frequency. Please enter 'Daily', 'Weekly', or 'Monthly'.")
+        return
+
+    # Generate the Lambda function code
+    lambda_code = generate_lambda_code(inputs)
+
+    # Save the Lambda function code as a .py file
+    lambda_filename = 'redshift_load_lambda.py'
+    with open(lambda_filename, 'w') as f:
+        f.write(lambda_code)
+    print(f"Lambda function code saved to {lambda_filename}")
+
+    # Create the Lambda function in AWS
+    create_lambda_function(inputs, lambda_filename)
+
+    # Set up EventBridge rule
+    setup_eventbridge_rule(inputs, frequency)
+    print("Automatic load scheduled successfully.")
+
 def main():
     """
     Main function to prompt user inputs, create a table, and load data into Redshift.
@@ -490,6 +751,13 @@ def main():
             inputs["region"],
             conn
         )
+
+        # After loading data, ask if the user wants to schedule automatic load
+        schedule_choice = input(f"Would you like to schedule an automatic load from {inputs['s3_path']}? (yes/no): ").strip().lower()
+        if schedule_choice == 'yes':
+            schedule_automatic_load(inputs)
+        else:
+            print("Data load complete. No automatic scheduling set up.")
 
     except Exception as e:
         print(f"Error: {e}")
