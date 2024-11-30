@@ -11,6 +11,7 @@ import sys  # Used to exit the script
 import json
 import zipfile
 import datetime  # Import datetime for proper handling in Lambda function
+import time  # Import time module for waiting
 
 def parse_endpoint(endpoint):
     """
@@ -455,12 +456,15 @@ def generate_lambda_code(inputs):
     """
     lambda_code = f'''import boto3
 import json
+import time
 import datetime
 
 def lambda_handler(event, context):
     redshift = boto3.client('redshift-data', region_name='{inputs['region']}')
 
-    sql_statement = """
+    truncate_statement = "TRUNCATE TABLE {inputs['schema_name']}.{inputs['table_name']};"
+
+    copy_statement = \"\"\"
         COPY {inputs['schema_name']}.{inputs['table_name']}
         FROM '{inputs['s3_path']}'
         IAM_ROLE '{inputs['iam_role']}'
@@ -475,22 +479,58 @@ def lambda_handler(event, context):
         ACCEPTINVCHARS
         COMPUPDATE OFF
         STATUPDATE OFF;
-    """
+    \"\"\"
 
     try:
-        response = redshift.execute_statement(
+        # Execute TRUNCATE TABLE
+        response_truncate = redshift.execute_statement(
             ClusterIdentifier='{inputs['cluster_identifier']}',
             Database='{inputs['database']}',
             DbUser='{inputs['db_user']}',
-            Sql=sql_statement
+            Sql=truncate_statement
         )
+        truncate_statement_id = response_truncate['Id']
+        print("Table truncation initiated successfully.")
+
+        # Wait for TRUNCATE TABLE to complete
+        wait_for_statement(redshift, truncate_statement_id)
+
+        # Execute COPY command
+        response_copy = redshift.execute_statement(
+            ClusterIdentifier='{inputs['cluster_identifier']}',
+            Database='{inputs['database']}',
+            DbUser='{inputs['db_user']}',
+            Sql=copy_statement
+        )
+        copy_statement_id = response_copy['Id']
         print("Data load initiated successfully.")
+
+        # Wait for COPY command to complete
+        wait_for_statement(redshift, copy_statement_id)
+
         # Process the response to ensure JSON serializable
-        serializable_response = make_serializable(response)
+        serializable_response = make_serializable(response_copy)
         return serializable_response
     except Exception as e:
-        print(f"Error executing COPY command: {{e}}")
+        print(f"Error executing commands: {{e}}")
         raise
+
+def wait_for_statement(redshift, statement_id):
+    """
+    Wait for a statement to finish executing.
+    """
+    while True:
+        response = redshift.describe_statement(Id=statement_id)
+        status = response['Status']
+        if status == 'FINISHED':
+            print(f"Statement {{statement_id}} finished successfully.")
+            break
+        elif status == 'FAILED':
+            print(f"Statement {{statement_id}} failed: {{response.get('Error', 'Unknown error')}}")
+            raise Exception(f"Statement {{statement_id}} failed: {{response.get('Error', 'Unknown error')}}")
+        else:
+            print(f"Statement {{statement_id}} status: {{status}}. Waiting...")
+            time.sleep(1)  # Wait for 1 second before checking again
 
 def make_serializable(obj):
     """
@@ -618,7 +658,7 @@ def create_lambda_iam_role(role_name, inputs):
 
     return iam_role_arn
 
-def create_lambda_function(inputs, lambda_filename):
+def create_lambda_function(inputs, lambda_filename, function_name):
     """
     Create the Lambda function in AWS.
     """
@@ -640,7 +680,7 @@ def create_lambda_function(inputs, lambda_filename):
 
     try:
         response = lambda_client.create_function(
-            FunctionName='RedshiftLoadLambdaFunction',
+            FunctionName=function_name,
             Runtime='python3.8',
             Role=iam_role_arn,
             Handler='redshift_load_lambda.lambda_handler',
@@ -650,16 +690,16 @@ def create_lambda_function(inputs, lambda_filename):
             MemorySize=128,
             Publish=True
         )
-        print("Lambda function created successfully.")
+        print(f"Lambda function '{function_name}' created successfully.")
     except lambda_client.exceptions.ResourceConflictException:
         # Function already exists, update it
         try:
             response = lambda_client.update_function_code(
-                FunctionName='RedshiftLoadLambdaFunction',
+                FunctionName=function_name,
                 ZipFile=zipped_code,
                 Publish=True
             )
-            print("Lambda function code updated successfully.")
+            print(f"Lambda function '{function_name}' code updated successfully.")
         except Exception as e:
             print(f"Error updating Lambda function code: {e}")
             raise
@@ -667,7 +707,7 @@ def create_lambda_function(inputs, lambda_filename):
         print(f"Error creating/updating Lambda function: {e}")
         raise
 
-def setup_eventbridge_rule(inputs, frequency):
+def setup_eventbridge_rule(inputs, frequency, function_name):
     """
     Set up an EventBridge rule to trigger the Lambda function at the specified frequency.
     """
@@ -685,7 +725,7 @@ def setup_eventbridge_rule(inputs, frequency):
         print("Invalid frequency.")
         return
 
-    rule_name = 'RedshiftLoadLambdaSchedule'
+    rule_name = f'RedshiftLoadLambdaSchedule_{function_name}'
 
     # Create or update the EventBridge rule
     try:
@@ -693,7 +733,7 @@ def setup_eventbridge_rule(inputs, frequency):
             Name=rule_name,
             ScheduleExpression=schedule_expression,
             State='ENABLED',
-            Description='Schedule to trigger the Lambda function to load data into Redshift'
+            Description=f'Schedule to trigger the Lambda function {function_name} to load data into Redshift'
         )
         rule_arn = response['RuleArn']
         print("EventBridge rule created or updated successfully.")
@@ -704,7 +744,7 @@ def setup_eventbridge_rule(inputs, frequency):
     # Add Lambda function as target
     try:
         # Get Lambda function ARN
-        response = lambda_client.get_function(FunctionName='RedshiftLoadLambdaFunction')
+        response = lambda_client.get_function(FunctionName=function_name)
         lambda_function_arn = response['Configuration']['FunctionArn']
 
         # Add Lambda function as target to the EventBridge rule
@@ -722,8 +762,8 @@ def setup_eventbridge_rule(inputs, frequency):
         # Give permission to EventBridge to invoke the Lambda function
         try:
             lambda_client.add_permission(
-                FunctionName='RedshiftLoadLambdaFunction',
-                StatementId='EventBridgeInvokeLambda',
+                FunctionName=function_name,
+                StatementId=f'EventBridgeInvokeLambda_{function_name}',
                 Action='lambda:InvokeFunction',
                 Principal='events.amazonaws.com',
                 SourceArn=rule_arn
@@ -753,11 +793,16 @@ def schedule_automatic_load(inputs):
         f.write(lambda_code)
     print(f"Lambda function code saved to {lambda_filename}")
 
+    # Generate the Lambda function name based on the table name
+    # Sanitize table name for Lambda function name (allow letters, numbers, underscores)
+    table_name_sanitized = re.sub(r'[^A-Za-z0-9_]', '_', inputs['table_name'])
+    function_name = f"RedshiftLoadTo{table_name_sanitized}"
+
     # Create the Lambda function in AWS
-    create_lambda_function(inputs, lambda_filename)
+    create_lambda_function(inputs, lambda_filename, function_name)
 
     # Set up EventBridge rule
-    setup_eventbridge_rule(inputs, frequency)
+    setup_eventbridge_rule(inputs, frequency, function_name)
     print("Automatic load scheduled successfully.")
 
 def main():
