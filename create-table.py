@@ -17,31 +17,20 @@ def parse_endpoint(endpoint):
     """
     Parse the endpoint string to extract host and port.
     """
-    # Remove any leading or trailing whitespace
     endpoint = endpoint.strip()
-
-    # Regular expression to match host, port, and optional path
     pattern = r'^(?P<host>[^:/]+(?:\.[^:/]+)*)(?::(?P<port>\d+))?(?:/(?P<path>.*))?$'
-
     match = re.match(pattern, endpoint)
-
     if match:
         host = match.group('host')
-        port = match.group('port')
-
-        if not port:
-            port = "5439"  # Default port
-
+        port = match.group('port') if match.group('port') else "5439"
         return host, port
     else:
-        # If the endpoint doesn't match the pattern, return None
         return None, None
 
 def extract_region_from_host(host):
     """
     Extract the AWS region from the Redshift cluster endpoint.
     """
-    # Regex pattern to extract region
     pattern = r'.*\.(.*?)\.redshift\.amazonaws\.com$'
     match = re.match(pattern, host)
     if match:
@@ -54,7 +43,6 @@ def extract_cluster_identifier(host):
     """
     Extract the cluster identifier from the Redshift cluster endpoint.
     """
-    # The cluster identifier is the first subdomain in the host
     parts = host.split('.')
     if len(parts) >= 1:
         cluster_identifier = parts[0]
@@ -62,272 +50,11 @@ def extract_cluster_identifier(host):
     else:
         return None
 
-def get_user_inputs():
+def quote_identifier(identifier):
     """
-    Prompt the user for Redshift and S3 details.
+    Safely quote SQL identifiers to handle special characters and reserved words.
     """
-    while True:
-        endpoint = input("Enter Redshift cluster endpoint (e.g., redshift-cluster-1.xxxx.us-west-2.redshift.amazonaws.com:5439/dev): ")
-
-        host, port = parse_endpoint(endpoint)
-        if not host:
-            print("Invalid endpoint format. Please re-enter the endpoint.")
-            continue
-
-        # Perform nslookup equivalent
-        try:
-            socket.gethostbyname(host)
-            print("Endpoint is valid.")
-        except socket.error:
-            print("Could not resolve host. Please re-enter the endpoint.")
-            continue
-
-        # Use 'nc' to try to connect to the endpoint and port
-        try:
-            result = subprocess.run(['nc', '-zv', host, port], capture_output=True, text=True)
-            if result.returncode == 0:
-                # Connection succeeded
-                print("Port is open. Proceeding to the next step.")
-                break
-            else:
-                # Connection failed
-                print(f"Connection to port {port} failed. Please ensure your EC2 instance security group is added to the Redshift allow list for inbound port {port}")
-        except Exception as e:
-            print(f"An error occurred while trying to check the port: {e}")
-            print(f"Connection failed. Please ensure your EC2 instance security group is added to the Redshift allow list for inbound port {port}")
-
-    # Extract region from the host
-    region = extract_region_from_host(host)
-    if not region:
-        print("Could not extract AWS region from the endpoint. Please ensure the endpoint is correct.")
-        return None
-
-    print(f"Region '{region}' extracted from the endpoint.")
-
-    # Extract cluster identifier from the host
-    cluster_identifier = extract_cluster_identifier(host)
-    if not cluster_identifier:
-        print("Could not extract cluster identifier from the endpoint. Please ensure the endpoint is correct.")
-        return None
-
-    print(f"Using '{cluster_identifier}' as cluster identifier.")
-
-    # Validate cluster identifier
-    try:
-        client = boto3.client('redshift', region_name=region)
-        response = client.describe_clusters(ClusterIdentifier=cluster_identifier)
-        print("Cluster identifier is valid. Proceeding to the next step.")
-    except ClientError as e:
-        if e.response['Error']['Code'] == 'ClusterNotFound':
-            print(f"Invalid cluster identifier '{cluster_identifier}'. Please check the endpoint and try again.")
-            return None
-        elif e.response['Error']['Code'] == 'AccessDenied':
-            print(f"Access denied when trying to describe the cluster. Please check your IAM permissions.")
-            return None
-        else:
-            print(f"An error occurred: {e}")
-            return None
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        return None
-
-    # Prompt for database username and check permissions
-    while True:
-        db_user = input("Enter the Redshift admin user name (e.g., 'admin_user'): ")
-        # Attempt to get temporary credentials
-        try:
-            temp_username, temp_password = get_temporary_credentials(
-                db_user=db_user,
-                cluster_identifier=cluster_identifier,
-                database='dev',  # Using 'dev' as a default database to test credentials
-                region=region
-            )
-            # Attempt to connect to the 'dev' database using the temporary credentials
-            try:
-                conn_test = psycopg2.connect(
-                    host=host,
-                    port=port,
-                    database='dev',
-                    user=temp_username,
-                    password=temp_password
-                )
-                conn_test.close()
-                print("Database user is valid. Proceeding to the next step.")
-                break
-            except psycopg2.OperationalError as e:
-                if 'does not exist' in str(e):
-                    print(f"Database user '{db_user}' does not exist in the database. Please enter the Redshift admin user name.")
-                else:
-                    print(f"Error connecting to the database with user '{db_user}': {e}")
-            except Exception as e:
-                print(f"An error occurred while testing database connection: {e}")
-        except ClientError as e:
-            error_code = e.response['Error']['Code']
-            error_message = e.response['Error']['Message']
-            if error_code == 'AccessDenied':
-                print(f"User '{db_user}' does not have sufficient permissions. Please enter a user with appropriate permissions.")
-            elif error_code == 'BadRequest':
-                print(f"User '{db_user}' does not exist or is invalid. Error: {error_message}. Please enter a valid database user.")
-            else:
-                print(f"An error occurred: {error_message}")
-        except Exception as e:
-            print(f"An error occurred: {e}")
-
-    # Prompt for database name and validate it
-    while True:
-        database = input("Enter Redshift database name (default is 'dev'. You can choose a different one or create a new database by entering its name): ") or "dev"
-        try:
-            # Get temporary credentials for the specified database
-            temp_username, temp_password = get_temporary_credentials(
-                db_user=db_user,
-                cluster_identifier=cluster_identifier,
-                database=database,
-                region=region
-            )
-            conn = psycopg2.connect(
-                host=host,
-                port=port,
-                database=database,
-                user=temp_username,
-                password=temp_password
-            )
-            conn.close()
-            print(f"Connected to Redshift database '{database}' successfully.")
-            break
-        except psycopg2.OperationalError as e:
-            error_message = str(e)
-            if 'does not exist' in error_message or 'database "' in error_message:
-                create_db = input(f"Database '{database}' does not exist. Would you like to create a new database now? (yes/no): ").strip().lower()
-                if create_db == 'yes':
-                    try:
-                        # Get temporary credentials for 'dev' database to create a new database
-                        temp_username_dev, temp_password_dev = get_temporary_credentials(
-                            db_user=db_user,
-                            cluster_identifier=cluster_identifier,
-                            database='dev',
-                            region=region
-                        )
-                        conn = psycopg2.connect(
-                            host=host,
-                            port=port,
-                            database='dev',
-                            user=temp_username_dev,
-                            password=temp_password_dev
-                        )
-                        conn.autocommit = True
-                        cur = conn.cursor()
-                        cur.execute(sql.SQL("CREATE DATABASE {}").format(quote_identifier(database)))
-                        conn.close()
-                        print(f"Database '{database}' created successfully.")
-                        continue  # Go back to the beginning of the loop to try connecting again
-                    except Exception as e:
-                        print(f"Failed to create database '{database}': {e}")
-                        continue
-                else:
-                    print("Please enter an existing database name.")
-            else:
-                print(f"Error connecting to the database: {e}")
-        except Exception as e:
-            print(f"An error occurred: {e}")
-
-    # Prompt for S3 file path and validate it
-    while True:
-        s3_path = input("Enter S3 file path (e.g., s3://your-bucket-name/your-file.csv): ")
-        if s3_path.startswith("s3://"):
-            print("S3 path is valid. Proceeding to the next step.")
-            break
-        else:
-            print("Invalid S3 path. Please enter a valid S3 URI starting with 's3://'.")
-
-    # Prompt for IAM Role ARN and validate it
-    while True:
-        iam_role = input("Enter IAM Role ARN for Redshift (e.g., arn:aws:iam::account-id:role/your-role): ")
-        try:
-            iam_client = boto3.client('iam')
-            role_name = iam_role.split('/')[-1]
-            response = iam_client.get_role(RoleName=role_name)
-            print("IAM Role ARN is valid. Proceeding to the next step.")
-            break
-        except ClientError as e:
-            error_code = e.response['Error']['Code']
-            if error_code == 'NoSuchEntity':
-                print(f"IAM Role '{iam_role}' does not exist. Please enter a valid IAM Role ARN.")
-            elif error_code == 'AccessDenied':
-                print(f"Access denied when trying to access the IAM Role. Please check your IAM permissions.")
-            else:
-                print(f"An error occurred: {e.response['Error']['Message']}")
-        except Exception as e:
-            print(f"An error occurred: {e}")
-
-    # Prompt for schema name and validate it
-    while True:
-        schema_name = input("Enter the schema name (default is 'public'. You can choose a different one or create a new schema by entering its name): ") or "public"
-        try:
-            conn = psycopg2.connect(
-                host=host,
-                port=port,
-                database=database,
-                user=temp_username,
-                password=temp_password
-            )
-            cur = conn.cursor()
-            # Check if the schema exists
-            cur.execute("SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname = %s;", (schema_name,))
-            result = cur.fetchone()
-            if result:
-                print(f"Schema '{schema_name}' exists. Proceeding to the next step.")
-                conn.close()
-                break
-            else:
-                create_schema = input(f"Schema '{schema_name}' does not exist. Would you like to create a new schema now? (yes/no): ").strip().lower()
-                if create_schema == 'yes':
-                    try:
-                        cur.execute(sql.SQL("CREATE SCHEMA {}").format(quote_identifier(schema_name)))
-                        conn.commit()
-                        print(f"Schema '{schema_name}' created successfully.")
-                        conn.close()
-                        break
-                    except Exception as e:
-                        conn.rollback()
-                        print(f"Failed to create schema '{schema_name}': {e}")
-                        conn.close()
-                        continue
-                else:
-                    print("Please enter an existing schema name.")
-                    conn.close()
-        except Exception as e:
-            print(f"An error occurred while validating or creating the schema: {e}")
-
-    # Prompt for table name
-    table_name = input("Enter the name of the Redshift table to create: ")
-
-    # Prompt for local CSV path and validate it
-    while True:
-        local_csv_path = input("Enter the local path of the CSV for schema inference: ")
-        if os.path.isfile(local_csv_path):
-            print("Local CSV file found. Proceeding to the next step.")
-            break
-        else:
-            print(f"File '{local_csv_path}' does not exist. Please enter a valid file path.")
-
-    # Get AWS account ID
-    sts_client = boto3.client('sts')
-    account_id = sts_client.get_caller_identity()['Account']
-
-    return {
-        "host": host,
-        "port": port,
-        "database": database,
-        "s3_path": s3_path,
-        "iam_role": iam_role,
-        "table_name": table_name,
-        "schema_name": schema_name,
-        "local_csv_path": local_csv_path,
-        "region": region,
-        "db_user": db_user,
-        "cluster_identifier": cluster_identifier,
-        "account_id": account_id
-    }
+    return sql.Identifier(identifier)
 
 def get_temporary_credentials(db_user, cluster_identifier, database, region):
     """
@@ -372,23 +99,12 @@ def map_data_types(df):
         columns.append((col, col_type))
     return columns
 
-def quote_identifier(identifier):
-    """
-    Safely quote SQL identifiers to handle special characters and reserved words.
-    """
-    return sql.Identifier(identifier)
-
 def create_table_from_csv(csv_file_path, table_name, schema_name, conn):
     """
     Create a table in Redshift by inferring schema from the CSV file structure.
     """
-    # Load the CSV locally to infer schema
     df = pd.read_csv(csv_file_path, nrows=1000)  # Read a sample to infer schema
-
-    # Infer column names and types
     columns = map_data_types(df)
-
-    # Construct the CREATE TABLE statement
     column_defs = [
         sql.SQL("{} {}").format(quote_identifier(col_name), sql.SQL(col_type))
         for col_name, col_type in columns
@@ -529,14 +245,14 @@ def wait_for_statement(redshift, statement_id):
             raise Exception(f"Statement {{statement_id}} failed: {{response.get('Error', 'Unknown error')}}")
         else:
             print(f"Statement {{statement_id}} status: {{status}}. Waiting...")
-            time.sleep(1)  # Wait for 1 second before checking again
+            time.sleep(1)
 
 def make_serializable(obj):
     \"\"\"
     Recursively convert objects to make them JSON serializable.
     \"\"\"
     if isinstance(obj, dict):
-        return {{{{k: make_serializable(v) for k, v in obj.items()}}}}
+        return {{k: make_serializable(v) for k, v in obj.items()}}
     elif isinstance(obj, list):
         return [make_serializable(element) for element in obj]
     elif isinstance(obj, (datetime.datetime, datetime.date, datetime.time)):
@@ -577,10 +293,7 @@ def create_lambda_iam_role(role_name, inputs):
         iam_role_arn = response['Role']['Arn']
         print(f"IAM role {role_name} already exists.")
 
-        # Get the existing assume role policy document
         assume_role_policy = response['Role']['AssumeRolePolicyDocument']
-
-        # Check if the policy already allows Lambda to assume the role
         lambda_principal_exists = False
         for statement in assume_role_policy.get('Statement', []):
             principal_service = statement.get('Principal', {}).get('Service', [])
@@ -591,7 +304,6 @@ def create_lambda_iam_role(role_name, inputs):
                 break
 
         if not lambda_principal_exists:
-            # Add the necessary statement to the assume role policy
             assume_role_policy['Statement'].append({
                 'Effect': 'Allow',
                 'Principal': {
@@ -599,7 +311,6 @@ def create_lambda_iam_role(role_name, inputs):
                 },
                 'Action': 'sts:AssumeRole'
             })
-            # Update the assume role policy document
             iam_client.update_assume_role_policy(
                 RoleName=role_name,
                 PolicyDocument=json.dumps(assume_role_policy)
@@ -608,7 +319,6 @@ def create_lambda_iam_role(role_name, inputs):
         else:
             print(f"Assume role policy for {role_name} already allows Lambda service.")
 
-    # Attach necessary managed policies to the role
     managed_policies = [
         'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole',
         'arn:aws:iam::aws:policy/AmazonRedshiftDataFullAccess',
@@ -628,7 +338,6 @@ def create_lambda_iam_role(role_name, inputs):
                 print(f"Error attaching policy {policy_arn}: {e}")
                 raise
 
-    # Create inline policy for redshift:GetClusterCredentials and include cluster resource
     inline_policy = {
         'Version': '2012-10-17',
         'Statement': [
@@ -662,18 +371,14 @@ def create_lambda_function(inputs, lambda_filename, function_name):
     Create the Lambda function in AWS.
     """
     lambda_client = boto3.client('lambda', region_name=inputs['region'])
-
-    # Zip the lambda function code
     zip_filename = 'redshift_load_lambda.zip'
     with zipfile.ZipFile(zip_filename, 'w') as z:
         z.write(lambda_filename)
     print(f"Lambda function code zipped into {zip_filename}.")
 
-    # Create IAM role for Lambda if not exists
     iam_role_name = 'RedshiftLoadLambdaRole'
     iam_role_arn = create_lambda_iam_role(iam_role_name, inputs)
 
-    # Read the zip file contents
     with open(zip_filename, 'rb') as f:
         zipped_code = f.read()
 
@@ -713,20 +418,18 @@ def setup_eventbridge_rule(inputs, frequency, function_name):
     events_client = boto3.client('events', region_name=inputs['region'])
     lambda_client = boto3.client('lambda', region_name=inputs['region'])
 
-    # Define the schedule expression based on the frequency
     if frequency == 'daily':
         schedule_expression = 'rate(1 day)'
     elif frequency == 'weekly':
         schedule_expression = 'rate(7 days)'
     elif frequency == 'monthly':
-        schedule_expression = 'cron(0 0 1 * ? *)'  # At 00:00 on day-of-month 1
+        schedule_expression = 'cron(0 0 1 * ? *)'
     else:
         print("Invalid frequency.")
         return
 
     rule_name = f'RedshiftLoadLambdaSchedule_{function_name}'
 
-    # Create or update the EventBridge rule
     try:
         response = events_client.put_rule(
             Name=rule_name,
@@ -740,13 +443,10 @@ def setup_eventbridge_rule(inputs, frequency, function_name):
         print(f"Error creating EventBridge rule: {e}")
         raise
 
-    # Add Lambda function as target
     try:
-        # Get Lambda function ARN
         response = lambda_client.get_function(FunctionName=function_name)
         lambda_function_arn = response['Configuration']['FunctionArn']
 
-        # Add Lambda function as target to the EventBridge rule
         response = events_client.put_targets(
             Rule=rule_name,
             Targets=[
@@ -758,7 +458,6 @@ def setup_eventbridge_rule(inputs, frequency, function_name):
         )
         print("Lambda function added as target to EventBridge rule.")
 
-        # Give permission to EventBridge to invoke the Lambda function
         try:
             lambda_client.add_permission(
                 FunctionName=function_name,
@@ -769,54 +468,290 @@ def setup_eventbridge_rule(inputs, frequency, function_name):
             )
             print("Permission granted to EventBridge to invoke the Lambda function.")
         except lambda_client.exceptions.ResourceConflictException:
-            # Permission already exists
             print("Permission for EventBridge to invoke Lambda function already exists.")
     except Exception as e:
         print(f"Error adding target to EventBridge rule: {e}")
         raise
 
 def schedule_automatic_load(inputs):
-    # Ask for frequency
     frequency = input("Enter the frequency of automatic load (Daily, Weekly, Monthly): ").strip().lower()
-    # Validate frequency
     if frequency not in ['daily', 'weekly', 'monthly']:
         print("Invalid frequency. Please enter 'Daily', 'Weekly', or 'Monthly'.")
         return
-
-    # Generate the Lambda function code
     lambda_code = generate_lambda_code(inputs)
-
-    # Save the Lambda function code as a .py file
     lambda_filename = 'redshift_load_lambda.py'
     with open(lambda_filename, 'w') as f:
         f.write(lambda_code)
     print(f"Lambda function code saved to {lambda_filename}")
 
-    # Generate the Lambda function name based on the table name
-    # Sanitize table name for Lambda function name (allow letters, numbers, underscores)
     table_name_sanitized = re.sub(r'[^A-Za-z0-9_]', '_', inputs['table_name'])
     function_name = f"RedshiftLoadTo{table_name_sanitized}"
-
-    # Create the Lambda function in AWS
     create_lambda_function(inputs, lambda_filename, function_name)
-
-    # Set up EventBridge rule
     setup_eventbridge_rule(inputs, frequency, function_name)
     print("Automatic load scheduled successfully.")
 
+def get_user_inputs():
+    """
+    Prompt the user for Redshift and S3 details.
+    """
+    while True:
+        endpoint = input("Enter Redshift cluster endpoint (e.g., redshift-cluster-1.xxxx.us-west-2.redshift.amazonaws.com:5439/dev): ")
+        host, port = parse_endpoint(endpoint)
+        if not host:
+            print("Invalid endpoint format. Please re-enter the endpoint.")
+            continue
+        try:
+            socket.gethostbyname(host)
+            print("Endpoint is valid.")
+        except socket.error:
+            print("Could not resolve host. Please re-enter the endpoint.")
+            continue
+
+        try:
+            result = subprocess.run(['nc', '-zv', host, port], capture_output=True, text=True)
+            if result.returncode == 0:
+                print("Port is open. Proceeding to the next step.")
+                break
+            else:
+                print(f"Connection to port {port} failed. Please ensure your EC2 instance security group is added to the Redshift allow list for inbound port {port}")
+        except Exception as e:
+            print(f"An error occurred while trying to check the port: {e}")
+            print(f"Connection failed. Please ensure your EC2 instance security group is added to the Redshift allow list for inbound port {port}")
+
+    region = extract_region_from_host(host)
+    if not region:
+        print("Could not extract AWS region from the endpoint. Please ensure the endpoint is correct.")
+        return None
+    print(f"Region '{region}' extracted from the endpoint.")
+
+    cluster_identifier = extract_cluster_identifier(host)
+    if not cluster_identifier:
+        print("Could not extract cluster identifier from the endpoint. Please ensure the endpoint is correct.")
+        return None
+    print(f"Using '{cluster_identifier}' as cluster identifier.")
+
+    try:
+        client = boto3.client('redshift', region_name=region)
+        response = client.describe_clusters(ClusterIdentifier=cluster_identifier)
+        print("Cluster identifier is valid. Proceeding to the next step.")
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ClusterNotFound':
+            print(f"Invalid cluster identifier '{cluster_identifier}'. Please check the endpoint and try again.")
+            return None
+        elif e.response['Error']['Code'] == 'AccessDenied':
+            print(f"Access denied when trying to describe the cluster. Please check your IAM permissions.")
+            return None
+        else:
+            print(f"An error occurred: {e}")
+            return None
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        return None
+
+    # Prompt for S3 file path at the beginning (now that region is known)
+    s3 = boto3.client('s3', region_name=region)
+    while True:
+        s3_path = input("Enter S3 file path (e.g., s3://your-bucket-name/your-file.csv): ")
+        if not s3_path.startswith("s3://"):
+            print("Invalid S3 file path.")
+            continue
+        # Parse bucket and key
+        match = re.match(r'^s3://([^/]+)/(.+)$', s3_path)
+        if not match:
+            print("Invalid S3 file path.")
+            continue
+        bucket_name = match.group(1)
+        s3_key = match.group(2)
+        local_csv_path = os.path.basename(s3_key)
+        print("Downloading file from S3...")
+        try:
+            s3.download_file(bucket_name, s3_key, local_csv_path)
+            print("Download complete.")
+            break
+        except Exception as e:
+            print(f"Download failed: {e}")
+
+    # Prompt for database username and check permissions
+    while True:
+        db_user = input("Enter the Redshift admin user name (e.g., 'admin_user'): ")
+        try:
+            temp_username, temp_password = get_temporary_credentials(
+                db_user=db_user,
+                cluster_identifier=cluster_identifier,
+                database='dev',
+                region=region
+            )
+            try:
+                conn_test = psycopg2.connect(
+                    host=host,
+                    port=port,
+                    database='dev',
+                    user=temp_username,
+                    password=temp_password
+                )
+                conn_test.close()
+                print("Database user is valid. Proceeding to the next step.")
+                break
+            except psycopg2.OperationalError as e:
+                if 'does not exist' in str(e):
+                    print(f"Database user '{db_user}' does not exist in the database. Please enter the Redshift admin user name.")
+                else:
+                    print(f"Error connecting to the database with user '{db_user}': {e}")
+            except Exception as e:
+                print(f"An error occurred while testing database connection: {e}")
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            error_message = e.response['Error']['Message']
+            if error_code == 'AccessDenied':
+                print(f"User '{db_user}' does not have sufficient permissions. Please enter a user with appropriate permissions.")
+            elif error_code == 'BadRequest':
+                print(f"User '{db_user}' does not exist or is invalid. Error: {error_message}. Please enter a valid database user.")
+            else:
+                print(f"An error occurred: {error_message}")
+        except Exception as e:
+            print(f"An error occurred: {e}")
+
+    # Prompt for database name and validate it
+    while True:
+        database = input("Enter Redshift database name (default is 'dev'. You can choose a different one or create a new database by entering its name): ") or "dev"
+        try:
+            temp_username, temp_password = get_temporary_credentials(
+                db_user=db_user,
+                cluster_identifier=cluster_identifier,
+                database=database,
+                region=region
+            )
+            conn = psycopg2.connect(
+                host=host,
+                port=port,
+                database=database,
+                user=temp_username,
+                password=temp_password
+            )
+            conn.close()
+            print(f"Connected to Redshift database '{database}' successfully.")
+            break
+        except psycopg2.OperationalError as e:
+            error_message = str(e)
+            if 'does not exist' in error_message or 'database "' in error_message:
+                create_db = input(f"Database '{database}' does not exist. Would you like to create a new database now? (yes/no): ").strip().lower()
+                if create_db == 'yes':
+                    try:
+                        temp_username_dev, temp_password_dev = get_temporary_credentials(
+                            db_user=db_user,
+                            cluster_identifier=cluster_identifier,
+                            database='dev',
+                            region=region
+                        )
+                        conn = psycopg2.connect(
+                            host=host,
+                            port=port,
+                            database='dev',
+                            user=temp_username_dev,
+                            password=temp_password_dev
+                        )
+                        conn.autocommit = True
+                        cur = conn.cursor()
+                        cur.execute(sql.SQL("CREATE DATABASE {}").format(quote_identifier(database)))
+                        conn.close()
+                        print(f"Database '{database}' created successfully.")
+                        continue
+                    except Exception as e:
+                        print(f"Failed to create database '{database}': {e}")
+                        continue
+                else:
+                    print("Please enter an existing database name.")
+            else:
+                print(f"Error connecting to the database: {e}")
+        except Exception as e:
+            print(f"An error occurred: {e}")
+
+    # Prompt for IAM Role ARN and validate it
+    while True:
+        iam_role = input("Enter IAM Role ARN for Redshift (e.g., arn:aws:iam::account-id:role/your-role): ")
+        try:
+            iam_client = boto3.client('iam')
+            role_name = iam_role.split('/')[-1]
+            response = iam_client.get_role(RoleName=role_name)
+            print("IAM Role ARN is valid. Proceeding to the next step.")
+            break
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            if error_code == 'NoSuchEntity':
+                print(f"IAM Role '{iam_role}' does not exist. Please enter a valid IAM Role ARN.")
+            elif error_code == 'AccessDenied':
+                print(f"Access denied when trying to access the IAM Role. Please check your IAM permissions.")
+            else:
+                print(f"An error occurred: {e.response['Error']['Message']}")
+        except Exception as e:
+            print(f"An error occurred: {e}")
+
+    # Prompt for schema name and validate it
+    while True:
+        schema_name = input("Enter the schema name (default is 'public'. You can choose a different one or create a new schema by entering its name): ") or "public"
+        try:
+            conn = psycopg2.connect(
+                host=host,
+                port=port,
+                database=database,
+                user=temp_username,
+                password=temp_password
+            )
+            cur = conn.cursor()
+            cur.execute("SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname = %s;", (schema_name,))
+            result = cur.fetchone()
+            if result:
+                print(f"Schema '{schema_name}' exists. Proceeding to the next step.")
+                conn.close()
+                break
+            else:
+                create_schema = input(f"Schema '{schema_name}' does not exist. Would you like to create a new schema now? (yes/no): ").strip().lower()
+                if create_schema == 'yes':
+                    try:
+                        cur.execute(sql.SQL("CREATE SCHEMA {}").format(quote_identifier(schema_name)))
+                        conn.commit()
+                        print(f"Schema '{schema_name}' created successfully.")
+                        conn.close()
+                        break
+                    except Exception as e:
+                        conn.rollback()
+                        print(f"Failed to create schema '{schema_name}': {e}")
+                        conn.close()
+                        continue
+                else:
+                    print("Please enter an existing schema name.")
+                    conn.close()
+        except Exception as e:
+            print(f"An error occurred while validating or creating the schema: {e}")
+
+    table_name = input("Enter the name of the Redshift table to create: ")
+
+    sts_client = boto3.client('sts')
+    account_id = sts_client.get_caller_identity()['Account']
+
+    return {
+        "host": host,
+        "port": port,
+        "database": database,
+        "s3_path": s3_path,
+        "iam_role": iam_role,
+        "table_name": table_name,
+        "schema_name": schema_name,
+        "local_csv_path": local_csv_path,
+        "region": region,
+        "db_user": db_user,
+        "cluster_identifier": cluster_identifier,
+        "account_id": account_id
+    }
+
 def main():
-    """
-    Main function to prompt user inputs, create a table, and load data into Redshift.
-    """
     conn = None
     try:
-        # Prompt for inputs
         inputs = get_user_inputs()
         if inputs is None:
             print("Failed to get necessary inputs. Exiting.")
             return
 
-        # Get temporary credentials
         temp_username, temp_password = get_temporary_credentials(
             db_user=inputs["db_user"],
             cluster_identifier=inputs["cluster_identifier"],
@@ -824,7 +759,6 @@ def main():
             region=inputs["region"]
         )
 
-        # Connect to Redshift using temporary credentials
         conn = psycopg2.connect(
             host=inputs["host"],
             port=inputs["port"],
