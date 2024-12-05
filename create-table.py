@@ -462,24 +462,23 @@ import datetime
 def lambda_handler(event, context):
     redshift = boto3.client('redshift-data', region_name='{inputs['region']}')
 
-    truncate_statement = "TRUNCATE TABLE {inputs['schema_name']}.{inputs['table_name']};"
+    truncate_statement = 'TRUNCATE TABLE "{inputs['schema_name']}"."{inputs['table_name']}";'
 
-    copy_statement = \"\"\"
-        COPY {inputs['schema_name']}.{inputs['table_name']}
-        FROM '{inputs['s3_path']}'
-        IAM_ROLE '{inputs['iam_role']}'
-        REGION '{inputs['region']}'
-        DELIMITER ','
-        IGNOREHEADER 1
-        FORMAT AS CSV
-        EMPTYASNULL
-        BLANKSASNULL
-        TIMEFORMAT 'auto'
-        TRUNCATECOLUMNS
-        ACCEPTINVCHARS
-        COMPUPDATE OFF
-        STATUPDATE OFF;
-    \"\"\"
+    copy_statement = \"\"\"COPY "{inputs['schema_name']}"."{inputs['table_name']}"
+    FROM '{inputs['s3_path']}'
+    IAM_ROLE '{inputs['iam_role']}'
+    REGION '{inputs['region']}'
+    DELIMITER ','
+    IGNOREHEADER 1
+    FORMAT AS CSV
+    EMPTYASNULL
+    BLANKSASNULL
+    TIMEFORMAT 'auto'
+    TRUNCATECOLUMNS
+    ACCEPTINVCHARS
+    COMPUPDATE OFF
+    STATUPDATE OFF;
+\"\"\"
 
     try:
         # Execute TRUNCATE TABLE
@@ -516,9 +515,9 @@ def lambda_handler(event, context):
         raise
 
 def wait_for_statement(redshift, statement_id):
-    """
+    \"\"\"
     Wait for a statement to finish executing.
-    """
+    \"\"\"
     while True:
         response = redshift.describe_statement(Id=statement_id)
         status = response['Status']
@@ -533,11 +532,11 @@ def wait_for_statement(redshift, statement_id):
             time.sleep(1)  # Wait for 1 second before checking again
 
 def make_serializable(obj):
-    """
+    \"\"\"
     Recursively convert objects to make them JSON serializable.
-    """
+    \"\"\"
     if isinstance(obj, dict):
-        return {{k: make_serializable(v) for k, v in obj.items()}}
+        return {{{{k: make_serializable(v) for k, v in obj.items()}}}}
     elif isinstance(obj, list):
         return [make_serializable(element) for element in obj]
     elif isinstance(obj, (datetime.datetime, datetime.date, datetime.time)):
