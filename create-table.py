@@ -14,9 +14,6 @@ import datetime  # Import datetime for proper handling in Lambda function
 import time  # Import time module for waiting
 
 def parse_endpoint(endpoint):
-    """
-    Parse the endpoint string to extract host and port.
-    """
     endpoint = endpoint.strip()
     pattern = r'^(?P<host>[^:/]+(?:\.[^:/]+)*)(?::(?P<port>\d+))?(?:/(?P<path>.*))?$'
     match = re.match(pattern, endpoint)
@@ -28,9 +25,6 @@ def parse_endpoint(endpoint):
         return None, None
 
 def extract_region_from_host(host):
-    """
-    Extract the AWS region from the Redshift cluster endpoint.
-    """
     pattern = r'.*\.(.*?)\.redshift\.amazonaws\.com$'
     match = re.match(pattern, host)
     if match:
@@ -40,9 +34,6 @@ def extract_region_from_host(host):
         return None
 
 def extract_cluster_identifier(host):
-    """
-    Extract the cluster identifier from the Redshift cluster endpoint.
-    """
     parts = host.split('.')
     if len(parts) >= 1:
         cluster_identifier = parts[0]
@@ -51,23 +42,17 @@ def extract_cluster_identifier(host):
         return None
 
 def quote_identifier(identifier):
-    """
-    Safely quote SQL identifiers to handle special characters and reserved words.
-    """
     return sql.Identifier(identifier)
 
 def get_temporary_credentials(db_user, cluster_identifier, database, region):
-    """
-    Generate temporary database credentials using IAM role.
-    """
     client = boto3.client('redshift', region_name=region)
     try:
         response = client.get_cluster_credentials(
             DbUser=db_user,
             DbName=database,
             ClusterIdentifier=cluster_identifier,
-            AutoCreate=False,  # Set to False to prevent auto-creation of user
-            DurationSeconds=3600  # Credentials valid for 1 hour
+            AutoCreate=False,
+            DurationSeconds=3600
         )
         temp_username = response['DbUser']
         temp_password = response['DbPassword']
@@ -80,9 +65,6 @@ def get_temporary_credentials(db_user, cluster_identifier, database, region):
         raise
 
 def map_data_types(df):
-    """
-    Map pandas dtypes to Redshift SQL data types.
-    """
     dtype_mapping = {
         'object': 'VARCHAR(65535)',
         'int64': 'BIGINT',
@@ -90,7 +72,7 @@ def map_data_types(df):
         'float64': 'DOUBLE PRECISION',
         'float32': 'REAL',
         'bool': 'BOOLEAN',
-        'datetime64[ns]': 'TIMESTAMP',
+        'datetime64[ns]': 'DATE'
     }
     columns = []
     for col in df.columns:
@@ -100,10 +82,7 @@ def map_data_types(df):
     return columns
 
 def create_table_from_csv(csv_file_path, table_name, schema_name, conn):
-    """
-    Create a table in Redshift by inferring schema from the CSV file structure.
-    """
-    df = pd.read_csv(csv_file_path, nrows=1000)  # Read a sample to infer schema
+    df = pd.read_csv(csv_file_path, nrows=1000)
     columns = map_data_types(df)
     column_defs = [
         sql.SQL("{} {}").format(quote_identifier(col_name), sql.SQL(col_type))
@@ -132,9 +111,6 @@ def create_table_from_csv(csv_file_path, table_name, schema_name, conn):
         sys.exit(1)
 
 def load_data_to_redshift(schema_name, table_name, s3_path, iam_role, region, conn):
-    """
-    Load data from S3 into the Redshift table using the COPY command.
-    """
     copy_query = sql.SQL("""
         COPY {}.{}
         FROM %s
@@ -167,9 +143,6 @@ def load_data_to_redshift(schema_name, table_name, s3_path, iam_role, region, co
         raise
 
 def generate_lambda_code(inputs):
-    """
-    Generate the Lambda function code as a string.
-    """
     lambda_code = f'''import boto3
 import json
 import time
@@ -207,10 +180,8 @@ def lambda_handler(event, context):
         truncate_statement_id = response_truncate['Id']
         print("Table truncation initiated successfully.")
 
-        # Wait for TRUNCATE TABLE to complete
         wait_for_statement(redshift, truncate_statement_id)
 
-        # Execute COPY command
         response_copy = redshift.execute_statement(
             ClusterIdentifier='{inputs['cluster_identifier']}',
             Database='{inputs['database']}',
@@ -220,10 +191,8 @@ def lambda_handler(event, context):
         copy_statement_id = response_copy['Id']
         print("Data load initiated successfully.")
 
-        # Wait for COPY command to complete
         wait_for_statement(redshift, copy_statement_id)
 
-        # Process the response to ensure JSON serializable
         serializable_response = make_serializable(response_copy)
         return serializable_response
     except Exception as e:
@@ -231,9 +200,6 @@ def lambda_handler(event, context):
         raise
 
 def wait_for_statement(redshift, statement_id):
-    \"\"\"
-    Wait for a statement to finish executing.
-    \"\"\"
     while True:
         response = redshift.describe_statement(Id=statement_id)
         status = response['Status']
@@ -248,11 +214,8 @@ def wait_for_statement(redshift, statement_id):
             time.sleep(1)
 
 def make_serializable(obj):
-    \"\"\"
-    Recursively convert objects to make them JSON serializable.
-    \"\"\"
     if isinstance(obj, dict):
-        return {{k: make_serializable(v) for k, v in obj.items()}}
+        return {k: make_serializable(v) for k, v in obj.items()}
     elif isinstance(obj, list):
         return [make_serializable(element) for element in obj]
     elif isinstance(obj, (datetime.datetime, datetime.date, datetime.time)):
@@ -263,9 +226,6 @@ def make_serializable(obj):
     return lambda_code
 
 def create_lambda_iam_role(role_name, inputs):
-    """
-    Create an IAM role for the Lambda function if it doesn't exist and attach necessary policies.
-    """
     iam_client = boto3.client('iam')
     lambda_assume_role_policy = {
         'Version': '2012-10-17',
@@ -367,9 +327,6 @@ def create_lambda_iam_role(role_name, inputs):
     return iam_role_arn
 
 def create_lambda_function(inputs, lambda_filename, function_name):
-    """
-    Create the Lambda function in AWS.
-    """
     lambda_client = boto3.client('lambda', region_name=inputs['region'])
     zip_filename = 'redshift_load_lambda.zip'
     with zipfile.ZipFile(zip_filename, 'w') as z:
@@ -396,7 +353,6 @@ def create_lambda_function(inputs, lambda_filename, function_name):
         )
         print(f"Lambda function '{function_name}' created successfully.")
     except lambda_client.exceptions.ResourceConflictException:
-        # Function already exists, update it
         try:
             response = lambda_client.update_function_code(
                 FunctionName=function_name,
@@ -412,9 +368,6 @@ def create_lambda_function(inputs, lambda_filename, function_name):
         raise
 
 def setup_eventbridge_rule(inputs, frequency, function_name):
-    """
-    Set up an EventBridge rule to trigger the Lambda function at the specified frequency.
-    """
     events_client = boto3.client('events', region_name=inputs['region'])
     lambda_client = boto3.client('lambda', region_name=inputs['region'])
 
@@ -491,9 +444,6 @@ def schedule_automatic_load(inputs):
     print("Automatic load scheduled successfully.")
 
 def get_user_inputs():
-    """
-    Prompt the user for Redshift and S3 details.
-    """
     while True:
         endpoint = input("Enter Redshift cluster endpoint (e.g., redshift-cluster-1.xxxx.us-west-2.redshift.amazonaws.com:5439/dev): ")
         host, port = parse_endpoint(endpoint)
@@ -548,14 +498,12 @@ def get_user_inputs():
         print(f"An error occurred: {e}")
         return None
 
-    # Prompt for S3 file path at the beginning (now that region is known)
     s3 = boto3.client('s3', region_name=region)
     while True:
         s3_path = input("Enter S3 file path (e.g., s3://your-bucket-name/your-file.csv): ")
         if not s3_path.startswith("s3://"):
             print("Invalid S3 file path.")
             continue
-        # Parse bucket and key
         match = re.match(r'^s3://([^/]+)/(.+)$', s3_path)
         if not match:
             print("Invalid S3 file path.")
@@ -571,7 +519,6 @@ def get_user_inputs():
         except Exception as e:
             print(f"Download failed: {e}")
 
-    # Prompt for database username and check permissions
     while True:
         db_user = input("Enter the Redshift admin user name (e.g., 'admin_user'): ")
         try:
@@ -611,7 +558,6 @@ def get_user_inputs():
         except Exception as e:
             print(f"An error occurred: {e}")
 
-    # Prompt for database name and validate it
     while True:
         database = input("Enter Redshift database name (default is 'dev'. You can choose a different one or create a new database by entering its name): ") or "dev"
         try:
@@ -666,7 +612,6 @@ def get_user_inputs():
         except Exception as e:
             print(f"An error occurred: {e}")
 
-    # Prompt for IAM Role ARN and validate it
     while True:
         iam_role = input("Enter IAM Role ARN for Redshift (e.g., arn:aws:iam::account-id:role/your-role): ")
         try:
@@ -686,7 +631,6 @@ def get_user_inputs():
         except Exception as e:
             print(f"An error occurred: {e}")
 
-    # Prompt for schema name and validate it
     while True:
         schema_name = input("Enter the schema name (default is 'public'. You can choose a different one or create a new schema by entering its name): ") or "public"
         try:
@@ -768,7 +712,6 @@ def main():
         )
         print("Connected to Redshift using IAM authentication")
 
-        # Step 1: Create the table
         print("Inferring schema and creating table...")
         create_table_from_csv(
             inputs["local_csv_path"],
@@ -777,7 +720,6 @@ def main():
             conn
         )
 
-        # Step 2: Load the data
         print("Loading data into Redshift...")
         load_data_to_redshift(
             inputs["schema_name"],
@@ -788,7 +730,6 @@ def main():
             conn
         )
 
-        # After loading data, ask if the user wants to schedule automatic load
         schedule_choice = input(f"Would you like to schedule an automatic load from {inputs['s3_path']}? (yes/no): ").strip().lower()
         if schedule_choice == 'yes':
             schedule_automatic_load(inputs)
